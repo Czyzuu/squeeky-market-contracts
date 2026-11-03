@@ -48,16 +48,20 @@ contract Exchange is EIP712, ERC1155Holder, ReentrancyGuard {
         require(msg.sender == operator && !paused, "Unavailable");
         for (uint256 i; i < matches.length; i++) _match(matches[i]);
         for (uint256 i; i < matches.length; i++) {
-            Order calldata taker = matches[i].taker;
-            bytes32 h = hashOrder(taker);
-            if (taker.timeInForce == 2) require(filled[h] == taker.size, "FOK incomplete");
-            if (taker.timeInForce == 3) cancelled[h] = true;
-            require(taker.timeInForce != 4, "Post-only cannot take");
+            _settleTimeInForce(matches[i].maker); _settleTimeInForce(matches[i].taker);
+            require(matches[i].taker.timeInForce != 4, "Post-only cannot take");
         }
+    }
+    /// FOK and IOC are signed by the order owner, so they bind whichever slot the operator puts the order in.
+    function _settleTimeInForce(Order calldata o) internal {
+        bytes32 h = hashOrder(o);
+        if (o.timeInForce == 2) require(filled[h] == o.size, "FOK incomplete");
+        if (o.timeInForce == 3) cancelled[h] = true;
     }
     function _match(Match calldata m) internal {
         Order calldata a = m.maker; Order calldata b = m.taker;
-        require(a.maker != b.maker, "Self trade");
+        // Prices are whole cents, so amounts in steps of 100 keep every notional exact.
+        require(a.maker != b.maker && m.amount % 100 == 0, "Self trade or amount");
         bytes32 ah = _check(a, m.makerSig, m.amount); bytes32 bh = _check(b, m.takerSig, m.amount);
         (bytes32 market, uint256 mask) = ctf.positions(a.tokenId);
         (bytes32 otherMarket, uint256 otherMask) = ctf.positions(b.tokenId);

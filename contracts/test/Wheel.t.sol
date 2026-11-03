@@ -107,6 +107,66 @@ contract WheelTest is ERC1155Holder {
         vm.prank(a); c.redeemPositions(id,masks); require(c.claimable(a)==10e6);
         uint256 before=u.balanceOf(a); vm.prank(a); c.withdraw(); require(u.balanceOf(a)==before+10e6);
     }
+    // --- IMD audit bc92d588 regressions ---
+    function finalizeAt(bytes32 id) internal view returns(uint256 t) { (,,t,,)=o.reports(id); }
+    function testGuardianInvalidatesWrongEarlyReport() public {
+        o.report(M,1001,keccak256("bad early"),false); o.overrideReport(M,0,keccak256("invalid"),true);
+        require(finalizeAt(M)==200010); vm.warp(100010); vm.expectRevert(); o.finalize(M);
+        vm.warp(200001); o.overrideReport(M,900,keccak256("noon"),false); require(finalizeAt(M)==200010);
+        vm.warp(200010); o.finalize(M); require(c.payout(M,0)==0 && c.payout(M,1)==1);
+    }
+    function testGuardianLowersEarlyReportToNo() public {
+        o.report(M,1001,bytes32(0),false); o.overrideReport(M,900,bytes32(0),false);
+        require(finalizeAt(M)==200010); vm.warp(200009); vm.expectRevert(); o.finalize(M);
+        vm.warp(200010); o.finalize(M); require(c.payout(M,1)==1);
+    }
+    function testOverrideCannotExtendDeadline() public {
+        vm.warp(200001); o.report(M,900,bytes32(0),false); require(finalizeAt(M)==200011);
+        vm.warp(200005); o.overrideReport(M,1100,bytes32(0),false); vm.warp(200010); o.overrideReport(M,800,bytes32(0),false);
+        require(finalizeAt(M)==200011); vm.warp(200011); vm.expectRevert(); o.overrideReport(M,1100,bytes32(0),false); o.finalize(M);
+    }
+    function testGuardianFilesReportWhenReporterSilent() public {
+        vm.warp(200000+1 days-1); vm.expectRevert(); o.overrideReport(M,0,bytes32(0),true);
+        vm.warp(200000+1 days); o.overrideReport(M,0,keccak256("reporter lost"),true);
+        vm.expectRevert(); o.report(M,900,bytes32(0),false);
+        vm.warp(200000+1 days+10); o.finalize(M); require(c.payout(M,0)==1 && c.payout(M,1)==1);
+    }
+    function testDisputeDelayIsBounded() public { vm.expectRevert(); new DistanceOracle(c,address(this),address(this),31 days); }
+    function testFirstComplementaryMintOnFreshMarket() public {
+        bytes32 id=keccak256("fresh"); uint256[] memory empty=new uint256[](0); o.createMarket(id,99999,200000,1000,true,empty);
+        Exchange.Order memory x=Exchange.Order(a,c.tokenId(id,1),0,600000,20e6,190000,1,25,0); Exchange.Order memory y=Exchange.Order(b,c.tokenId(id,2),0,400000,20e6,190000,2,25,0);
+        matchPair(x,y,5e6); require(c.balanceOf(a,c.tokenId(id,1))==5e6 && c.balanceOf(b,c.tokenId(id,2))==5e6 && c.locked(id)==5e6);
+    }
+    function testUnionMintNeedsRegistration() public {
+        bytes32 id=keccak256("four"); uint256[] memory bounds=new uint256[](3); bounds[0]=500; bounds[1]=1000; bounds[2]=2000; o.createMarket(id,99999,200000,0,false,bounds);
+        Exchange.Order memory x=Exchange.Order(a,c.tokenId(id,3),0,500000,20e6,190000,1,25,0); Exchange.Order memory y=Exchange.Order(b,c.tokenId(id,12),0,500000,20e6,190000,2,25,0);
+        vm.expectRevert(); this.matchPair(x,y,1e6);
+        c.registerPosition(id,3); c.registerPosition(id,12); matchPair(x,y,1e6); require(c.balanceOf(b,c.tokenId(id,12))==1e6);
+        vm.expectRevert(); c.registerPosition(id,15);
+    }
+    function testMakerFokAndIocAreEnforced() public {
+        Exchange.Order memory x=order(a,1,1,600000,1); Exchange.Order memory y=order(b,1,0,700000,2);
+        x.timeInForce=2; x.size=5e6; vm.expectRevert(); this.matchPair(x,y,3e6); matchPair(x,y,5e6);
+        x.nonce=3; x.timeInForce=3; x.size=20e6; matchPair(x,y,2e6); require(e.cancelled(e.hashOrder(x)));
+        vm.expectRevert(); this.matchPair(x,y,1e6);
+    }
+    function testAmountsMustKeepNotionalExact() public {
+        Exchange.Order memory x=order(a,1,1,500000,1); Exchange.Order memory y=order(b,1,0,500000,2);
+        vm.expectRevert(); this.matchPair(x,y,1); vm.expectRevert(); this.matchPair(x,y,1e6+50);
+        uint256 before=u.balanceOf(b); matchPair(x,y,1e6+100); require(before-u.balanceOf(b)==500050+1250);
+    }
+    function testInvalidRedeemLeavesNoDust() public {
+        vm.prank(a); c.splitPosition(M,1,1);
+        vm.warp(200001); o.report(M,0,bytes32(0),true); vm.warp(200011); o.finalize(M);
+        uint256[] memory masks=new uint256[](2); masks[0]=1; masks[1]=2; vm.prank(a); c.redeemPositions(M,masks);
+        require(c.claimable(a)==10e6+1 && c.locked(M)==0);
+    }
+    function testEightOutcomeMarket() public {
+        bytes32 id=keccak256("eight"); uint256[] memory bounds=new uint256[](7); for(uint256 i;i<7;i++) bounds[i]=(i+1)*500;
+        o.createMarket(id,99999,200000,0,false,bounds); require(c.fullMask(id)==255);
+        vm.prank(a); c.splitPosition(id,128,1e6); vm.warp(200000); o.report(id,4000,bytes32(0),false); vm.warp(200010); o.finalize(id);
+        uint256[] memory masks=new uint256[](1); masks[0]=128; vm.prank(a); c.redeemPositions(id,masks); require(c.claimable(a)==1e6);
+    }
     function testFuzzMintConservesCollateral(uint96 raw,uint8 cent) public {
         uint256 amount=(uint256(raw)%100+1)*1e6; uint256 price=(uint256(cent)%98+1)*10000;
         Exchange.Order memory x=order(a,1,0,price,1); Exchange.Order memory y=order(b,2,0,1e6-price,2); x.size=amount; y.size=amount;

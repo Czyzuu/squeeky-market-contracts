@@ -27,9 +27,14 @@ contract ConditionalTokens is ERC1155, ReentrancyGuard {
     function prepare(bytes32 market, uint8 outcomes) external {
         require(msg.sender == oracle && outcomes >= 2 && outcomes <= 8 && conditions[market].outcomes == 0, "Bad condition");
         conditions[market].outcomes = outcomes;
+        // Register singletons and their complements so the exchange can mint them before any split.
+        uint256 full = fullMask(market);
+        for (uint256 i; i < outcomes; i++) { _id(market, 1 << i); _id(market, full ^ (1 << i)); }
         emit Prepared(market, outcomes);
     }
     function fullMask(bytes32 market) public view returns (uint256) { return (1 << conditions[market].outcomes) - 1; }
+    /// Permissionless registration for union positions (e.g. bucket ranges) not covered by prepare.
+    function registerPosition(bytes32 market, uint256 mask) external { require(mask > 0 && mask < fullMask(market), "Bad mask"); _id(market, mask); }
     function tokenId(bytes32 market, uint256 mask) public pure returns (uint256) { return uint256(keccak256(abi.encode(market, mask))); }
     function _id(bytes32 market, uint256 mask) internal returns (uint256 id) {
         id = tokenId(market, mask); positions[id] = Position(market, mask);
@@ -76,13 +81,14 @@ contract ConditionalTokens is ERC1155, ReentrancyGuard {
     }
     function redeemPositions(bytes32 market, uint256[] calldata masks) external nonReentrant {
         Condition memory c = conditions[market]; require(c.resolved, "Unresolved");
-        uint256 value;
+        uint256 weighted;
         for (uint256 j; j < masks.length; j++) {
             uint256 mask = masks[j]; require(mask > 0 && mask < fullMask(market), "Bad mask");
             uint256 id = tokenId(market, mask); uint256 amount = balanceOf(msg.sender, id); uint256 num;
             for (uint256 i; i < c.outcomes; i++) if ((mask & (1 << i)) != 0) num += payout[market][i];
-            _burn(msg.sender, id, amount); value += amount * num / c.denominator;
+            _burn(msg.sender, id, amount); weighted += amount * num;
         }
+        uint256 value = weighted / c.denominator;
         locked[market] -= value; claimable[msg.sender] += value;
         emit Redeemed(msg.sender, market, value);
     }
